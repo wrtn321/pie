@@ -6,7 +6,7 @@ import re
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLineEdit, QListWidget, QTextEdit, QMessageBox,
-    QFileDialog, QListWidgetItem, QTabWidget
+    QFileDialog, QListWidgetItem, QTabWidget, QInputDialog, QMenu
 )
 from PyQt6.QtGui import QAction
 from PyQt6.QtCore import pyqtSignal, Qt
@@ -76,7 +76,17 @@ class EditorWindow(QWidget):
         content = self.content_edit.toPlainText()
         if not title: QMessageBox.warning(self, "입력 오류", "제목을 입력해주세요."); return
         geo = self.geometry()
+        
+        # ### 변경점: JSON 저장 방식 변경 ###
+        is_pinned = False
+        if not self.is_new_memo:
+            is_pinned = self.memos_data[self.memo_index].get('pinned', False)
+        
         current_memo = {'title': title, 'content': content, 'geometry': (geo.x(), geo.y(), geo.width(), geo.height())}
+        # 고정 상태가 True일 때만 'pinned' 키를 추가
+        if is_pinned:
+            current_memo['pinned'] = True
+        
         if self.is_new_memo:
             self.memos_data.append(current_memo); self.memo_index = len(self.memos_data) - 1
             self.is_new_memo = False; self.delete_button.setEnabled(True)
@@ -95,6 +105,11 @@ class EditorWindow(QWidget):
         filepath, _ = QFileDialog.getSaveFileName(self, "TXT 파일로 저장", safe_filename, "Text Documents (*.txt);;All Files (*)")
         if filepath:
             with open(filepath, "w", encoding="utf-8") as f: f.write(content)
+    def find_text_in_content(self):
+        text, ok = QInputDialog.getText(self, "찾기", "찾을 내용:")
+        if ok and text:
+            if not self.content_edit.find(text):
+                QMessageBox.information(self, "찾기", f"'{text}'를 찾을 수 없습니다.")
     def closeEvent(self, event):
         current_title = self.title_edit.text(); current_content = self.content_edit.toPlainText()
         if self.original_title != current_title or self.original_content != current_content:
@@ -104,7 +119,14 @@ class EditorWindow(QWidget):
             else: event.ignore()
         else: event.accept()
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_Escape: self.close()
+        if event.modifiers() == Qt.KeyboardModifier.ControlModifier and event.key() == Qt.Key.Key_S:
+            self.save_memo()
+        elif event.modifiers() == Qt.KeyboardModifier.ControlModifier and event.key() == Qt.Key.Key_F:
+            self.find_text_in_content()
+        elif event.key() == Qt.Key.Key_Escape:
+            self.close()
+        else:
+            super().keyPressEvent(event)
 
 # --- MemoListWidget 클래스 ---
 class MemoListWidget(QWidget):
@@ -114,37 +136,80 @@ class MemoListWidget(QWidget):
         self.parent_window = parent_window
         self.memos_data = load_memos(filepath)
         self.initUI()
-
     def initUI(self):
         main_layout = QVBoxLayout(self)
         top_layout = QHBoxLayout()
         new_memo_button = QPushButton("📄 새 메모")
-        self.search_entry = QLineEdit(placeholderText="메모 검색...")
+        self.search_entry = QLineEdit(placeholderText="메모 검색... (ESC로 초기화)")
         top_layout.addWidget(new_memo_button)
         top_layout.addWidget(self.search_entry)
         self.memo_list = QListWidget()
         main_layout.addLayout(top_layout)
         main_layout.addWidget(self.memo_list)
-        
-        # '새 메모' 버튼은 별도의 함수에 연결
         new_memo_button.clicked.connect(self.create_new_memo) 
-        
         self.search_entry.textChanged.connect(self.update_memo_list)
+        self.search_entry.keyPressEvent = self.search_key_press_event
         self.memo_list.itemActivated.connect(self.open_editor_for_item)
+        self.memo_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.memo_list.customContextMenuRequested.connect(self.show_context_menu)
         self.update_memo_list()
-        
     def update_memo_list(self):
         search_term = self.search_entry.text().lower()
         self.memo_list.clear()
+        filtered_memos = []
         for i, memo in enumerate(self.memos_data):
             if search_term in memo['title'].lower() or search_term in memo['content'].lower():
-                item = QListWidgetItem(memo['title'])
-                item.setData(Qt.ItemDataRole.UserRole, i)
-                self.memo_list.addItem(item)
-    
-    # 새 메모 생성을 위한 전용 함수 추가
+                filtered_memos.append((i, memo))
+        pinned_items = [item for item in filtered_memos if item[1].get('pinned', False)]
+        unpinned_items = [item for item in filtered_memos if not item[1].get('pinned', False)]
+        for original_index, memo in pinned_items:
+            item = QListWidgetItem(f"📌 {memo['title']}")
+            item.setData(Qt.ItemDataRole.UserRole, original_index)
+            self.memo_list.addItem(item)
+        for original_index, memo in unpinned_items:
+            item = QListWidgetItem(memo['title'])
+            item.setData(Qt.ItemDataRole.UserRole, original_index)
+            self.memo_list.addItem(item)
+    def sort_memos_by_name(self):
+        pinned = [m for m in self.memos_data if m.get('pinned', False)]
+        unpinned = [m for m in self.memos_data if not m.get('pinned', False)]
+        unpinned.sort(key=lambda memo: memo['title'].lower())
+        self.memos_data[:] = pinned + unpinned
+        save_memos(self.memos_data, self.filepath)
+        self.update_memo_list()
+    def search_key_press_event(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self.search_entry.clear()
+        else:
+            QLineEdit.keyPressEvent(self.search_entry, event)
+    def show_context_menu(self, position):
+        item = self.memo_list.itemAt(position)
+        if not item: return
+        memo_index = item.data(Qt.ItemDataRole.UserRole)
+        memo = self.memos_data[memo_index]
+        is_pinned = memo.get('pinned', False)
+        menu = QMenu()
+        pin_action_text = "메모 고정 해제" if is_pinned else "메모 상단 고정"
+        pin_action = QAction(pin_action_text, self)
+        pin_action.triggered.connect(lambda: self.toggle_pin_status(memo_index))
+        menu.addAction(pin_action)
+        menu.exec(self.memo_list.mapToGlobal(position))
+
+    def toggle_pin_status(self, memo_index):
+        current_status = self.memos_data[memo_index].get('pinned', False)
+        # ### 변경점: JSON 저장 방식 변경 ###
+        if not current_status:
+            # 고정할 때: 'pinned' 키를 True로 설정
+            self.memos_data[memo_index]['pinned'] = True
+        else:
+            # 고정 해제할 때: 'pinned' 키를 삭제
+            if 'pinned' in self.memos_data[memo_index]:
+                del self.memos_data[memo_index]['pinned']
+        
+        save_memos(self.memos_data, self.filepath)
+        self.update_memo_list()
+        
     def create_new_memo(self):
-        # memo_index를 명시적으로 None으로 하여 open_editor 호출
         self.open_editor(memo_index=None)
         
     def open_editor(self, memo_index=None):
@@ -167,11 +232,33 @@ class MainWindow(QMainWindow):
         self.restore_session()
         
     def initUI(self):
-        self.setWindowTitle("메모장 v1.1")
-        menubar = self.menuBar(); file_menu = menubar.addMenu("파일")
-        new_tab_action = QAction("새 탭 만들기", self); new_tab_action.triggered.connect(self.create_new_tab)
-        open_action = QAction("파일 열기", self); open_action.triggered.connect(self.open_file_dialog)
-        file_menu.addAction(new_tab_action); file_menu.addAction(open_action)
+        self.setWindowTitle("메모장 v1.2")
+        menubar = self.menuBar()
+        file_menu = menubar.addMenu("파일")
+        view_menu = menubar.addMenu("보기")
+
+        # ### 변경점: Ctrl+N 단축키 기능 변경 ###
+        # '새 메모' 액션 추가 및 Ctrl+N 단축키 할당
+        new_memo_action = QAction("새 메모", self)
+        new_memo_action.setShortcut("Ctrl+N")
+        new_memo_action.triggered.connect(self.create_new_memo_in_current_tab)
+        
+        # '새 탭 만들기' 액션은 그대로 두되 단축키는 제거
+        new_tab_action = QAction("새 탭 만들기", self)
+        new_tab_action.triggered.connect(self.create_new_tab)
+        
+        open_action = QAction("파일 열기", self)
+        open_action.triggered.connect(self.open_file_dialog)
+
+        # 메뉴에 액션들 추가
+        file_menu.addAction(new_memo_action)
+        file_menu.addAction(new_tab_action)
+        file_menu.addAction(open_action)
+        
+        sort_by_name_action = QAction("이름순 정렬", self)
+        sort_by_name_action.triggered.connect(self.sort_current_tab_by_name)
+        view_menu.addAction(sort_by_name_action)
+        
         self.tabs = QTabWidget(); self.tabs.setTabsClosable(True)
         self.tabs.tabCloseRequested.connect(self.close_tab)
         self.setCentralWidget(self.tabs)
@@ -179,40 +266,56 @@ class MainWindow(QMainWindow):
         if geometry: self.setGeometry(*geometry)
         else: self.setGeometry(100, 100, 500, 600)
 
+    def sort_current_tab_by_name(self):
+        current_widget = self.tabs.currentWidget()
+        if isinstance(current_widget, MemoListWidget):
+            current_widget.sort_memos_by_name()
+    
+    # ### 변경점: '새 메모' (Ctrl+N) 기능을 위한 메서드 ###
+    def create_new_memo_in_current_tab(self):
+        current_widget = self.tabs.currentWidget()
+        if isinstance(current_widget, MemoListWidget):
+            current_widget.create_new_memo()
+
     def add_memo_tab(self, filepath):
         for i in range(self.tabs.count()):
             if self.tabs.tabToolTip(i) == filepath: self.tabs.setCurrentIndex(i); return
-        
         memo_list_widget = MemoListWidget(filepath, self)
-        
-        # 파일명에서 확장자를 제거하여 탭 이름으로 설정
         base_filename = os.path.basename(filepath)
-        tab_name, _ = os.path.splitext(base_filename) # (파일명, 확장자)로 분리
-        
-        index = self.tabs.addTab(memo_list_widget, tab_name) # 확장자 없는 이름을 탭 이름으로 사용
-        self.tabs.setTabToolTip(index, filepath) # 툴팁에는 여전히 전체 경로를 저장하여 기능이 정상 동작하도록 함
+        tab_name, _ = os.path.splitext(base_filename)
+        index = self.tabs.addTab(memo_list_widget, tab_name)
+        self.tabs.setTabToolTip(index, filepath)
         self.tabs.setCurrentIndex(index)
+        
     def create_new_tab(self):
         filepath, _ = QFileDialog.getSaveFileName(self, "새 메모 파일 저장", "", "JSON Files (*.json)")
         if filepath:
             if not filepath.endswith('.json'): filepath += '.json'
             save_memos([], filepath); self.add_memo_tab(filepath)
+            
     def open_file_dialog(self):
         filepath, _ = QFileDialog.getOpenFileName(self, "메모 파일 열기", "", "JSON Files (*.json)")
         if filepath: self.add_memo_tab(filepath)
+        
     def close_tab(self, index): self.tabs.removeTab(index)
+    
     def restore_session(self):
         open_tabs = self.config_data.get("open_tabs", [])
         if open_tabs:
             for filepath in open_tabs:
                 if os.path.exists(filepath): self.add_memo_tab(filepath)
         if self.tabs.count() == 0: self.add_memo_tab(DEFAULT_MEMO_FILE)
+        
     def closeEvent(self, event):
         open_tabs_paths = [self.tabs.tabToolTip(i) for i in range(self.tabs.count())]
         self.config_data['open_tabs'] = open_tabs_paths
         geo = self.geometry()
         self.config_data['geometry'] = (geo.x(), geo.y(), geo.width(), geo.height())
         save_config(self.config_data)
+        
+        for editor in self.editor_windows[:]:
+            editor.close()
+            
         event.accept()
 
 # --- 프로그램 실행 ---
